@@ -1,4 +1,5 @@
 import os, re, io
+import shutil
 from typing import Optional
 import fitz  # PyMuPDF
 import pytesseract
@@ -26,9 +27,9 @@ SPECIAL_PAT = [
 
 CHAPTER_PATTERNS = [
     re.compile(r'^CHAPTER\s+(?:ONE\s+HUNDRED\s+(?:AND\s+)?(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY)?)$'),
-    re.compile(r'^CHAPTER\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY)(?:\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE))?$'),
-    re.compile(r'^CHAPTER\s+\d+$'),   # Numeric
-    re.compile(r'^CHAPTER\s+[IVX]+$') # Roman numerals
+    re.compile(r'^CHAPTER\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY)(?:\s*-\s*|\s+)?(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE)?$', re.IGNORECASE),
+    re.compile(r'^CHAPTER\s+\d+$', re.IGNORECASE),
+    re.compile(r'^CHAPTER\s+[IVX]+$', re.IGNORECASE)
 ]
 
 # ---------------- Utilities ----------------
@@ -105,6 +106,14 @@ def extract_heading_from_text(text: str) -> Optional[str]:
             subtitle = " " + lines[1]
         return (lines[0] + subtitle).title().replace("  ", " ")
 
+    # 5b. Scan first few lines for a Prologue/Epilogue heading not at line 1
+    for idx in range(1, min(6, len(lines))):
+        if lines[idx].upper().startswith("PROLOGUE") or lines[idx].upper().startswith("EPILOGUE"):
+            subtitle = ""
+            if idx + 1 < len(lines) and lines[idx + 1].isupper():
+                subtitle = " " + lines[idx + 1]
+            return (lines[idx] + subtitle).title().replace("  ", " ")
+
     # 6. Fallback wide-scan for Honeymoon/Interview when no heading found
     upper_text = text.upper()
     if " HONEYMOON" in upper_text or upper_text.startswith("HONEYMOON"):
@@ -150,6 +159,21 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
     debug_log = []
     created_dirs = set()
 
+    # Create Whole Book folder and copy original PDF into it
+    whole_book_root = Path(output_root) / root_dup / root_dup / f"{book_base}_Whole_Book"
+    whole_book_root.mkdir(parents=True, exist_ok=True)
+    try:
+        src_pdf = Path(pdf_path)
+        if src_pdf.exists():
+            dest_pdf = whole_book_root / src_pdf.name
+            if not dest_pdf.exists():
+                shutil.copy2(str(src_pdf), str(dest_pdf))
+            debug_log.append(f"Whole book copied to: {dest_pdf}")
+        else:
+            debug_log.append(f"Source PDF not found for whole book copy: {pdf_path}")
+    except Exception as e:
+        debug_log.append(f"Failed to copy whole book PDF: {e}")
+
     with fitz.open(pdf_path) as doc:
         n = doc.page_count
         debug_log.append(f"Processing PDF with {n} pages")
@@ -160,6 +184,20 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
         seen_first_content = False
         # Lock a few pages after setting a parent to keep early pages inside parent
         parent_lock_remaining = 0
+
+        def detect_upcoming_child(start_index: int) -> Optional[str]:
+            """Look ahead a couple of pages to see if a child section starts soon."""
+            lookahead_limit = min(n, start_index + 3)
+            for j in range(start_index + 1, lookahead_limit):
+                nxt = doc[j]
+                nxt_text = nxt.get_text("text")
+                if aggressive_ocr and not nxt_text.strip():
+                    nxt_text = ocr_page_cached(pdf_path, j)
+                nxt_heading = extract_heading_from_text(nxt_text) or ""
+                u = nxt_heading.upper()
+                if u.startswith("PART") or u.startswith("CHAPTER") or u.startswith("PROLOGUE") or u.startswith("EPILOGUE"):
+                    return nxt_heading
+            return None
 
         for i, page in enumerate(doc):
             text = page.get_text("text")
@@ -265,6 +303,31 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Index"
                     filename = f"{book_base}_Index_Page {i-3}.pdf"
                     section_type = "Index"
+                elif current_parent and not current_part and not current_chapter:
+                    # We're in a parent-only state; try to foresee the next child section
+                    upcoming = detect_upcoming_child(i)
+                    if upcoming:
+                        up_upper = upcoming.upper()
+                        if up_upper.startswith("PROLOGUE") or up_upper.startswith("EPILOGUE"):
+                            child = clean_directory_name(upcoming.title())
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
+                            filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
+                            section_type = f"Preceding page routed to upcoming special under parent: {current_parent}/{child}"
+                        elif up_upper.startswith("PART"):
+                            child = clean_directory_name(upcoming.title())
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
+                            filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
+                            section_type = f"Preceding page routed to upcoming part under parent: {current_parent}/{child}"
+                        elif up_upper.startswith("CHAPTER"):
+                            # Rare: chapter directly under parent; place under parent+chapter
+                            child = clean_directory_name(upcoming.title())
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
+                            filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
+                            section_type = f"Preceding page routed to upcoming chapter under parent: {current_parent}/{child}"
+                    else:
+                        section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}"
+                        filename = f"{book_base}_{current_parent}_Page {page_number}.pdf"
+                        section_type = "Page inside parent"
                 elif current_parent and current_part and current_chapter:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}" / f"{book_base}_{current_parent}_{current_part}_{current_chapter}"
                     filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_number}.pdf"
