@@ -1,355 +1,447 @@
-import os, re, math, concurrent.futures
+import os, re, io
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict
 import fitz  # PyMuPDF
 import pytesseract
 from PIL import Image
-import numpy as np
 from pathlib import Path
 
-
-# ---------- Heuristics & utilities ----------
-import io
+# More flexible patterns
+PART_PAT = re.compile(r'^\s*PART\s+[A-Z0-9 ]+', re.IGNORECASE)
+SPECIAL_PAT = [
+    re.compile(r'^\s*PROLOGUE\s*$', re.IGNORECASE),
+    re.compile(r'^\s*EPILOGUE\s*$', re.IGNORECASE),
+    re.compile(r'^\s*HONEYMOON\s*$', re.IGNORECASE),
+    re.compile(r'^\s*AN INTERVIEW WITH THE WOMEN\'S MURDER CLUB\s*$', re.IGNORECASE),
+]
+# ---------- Utilities ----------
 
 def save_page_as_pdf(page, out_file: Path):
-    """
-    Save a single PyMuPDF page as its own PDF file.
-    """
+    """Save a single PyMuPDF page as its own PDF file."""
     out_file.parent.mkdir(parents=True, exist_ok=True)
-
-    new_doc = fitz.open()           # create new empty PDF
+    new_doc = fitz.open()
     new_doc.insert_pdf(page.parent, from_page=page.number, to_page=page.number)
     new_doc.save(str(out_file))
     new_doc.close()
 
-
 def ocr_page(page):
-    """
-    Run OCR on a PyMuPDF page and return extracted text.
-    """
-    pix = page.get_pixmap(dpi=300)  # render page at 300 DPI
+    """Run OCR on a PyMuPDF page and return extracted text."""
+    pix = page.get_pixmap(dpi=300)
     img_bytes = pix.tobytes("png")
     img = Image.open(io.BytesIO(img_bytes))
     text = pytesseract.image_to_string(img, lang="eng")
     return text
 
-def extract_heading(page, aggressive_ocr=False):
-    text = page.get_text("text")
-    if aggressive_ocr and not text.strip():
-        text = ocr_page(page)
 
+def is_chapter_heading(text_lines):
+    """
+    More robust chapter detection that handles various formats and multi-line titles.
+    Returns (is_chapter, chapter_title) tuple.
+    """
+    if not text_lines:
+        return False, None
+    
+    print(f"DEBUG: is_chapter_heading received {len(text_lines)} lines:")
+    for i, line in enumerate(text_lines[:10]):  # Show first 10 lines
+        print(f"DEBUG:   Line {i}: '{line}' (length: {len(line)})")
+    
+    # Try different combinations of lines to build chapter title
+    for num_lines in range(1, min(8, len(text_lines) + 1)):
+        candidate = " ".join(text_lines[:num_lines]).strip()
+        
+        # Remove extra whitespace
+        candidate = re.sub(r'\s+', ' ', candidate)
+        
+        print(f"DEBUG: Trying {num_lines} lines: '{candidate}'")
+        
+        # Check if it starts with CHAPTER (case insensitive)
+        if re.match(r'^\s*CHAPTER\s+', candidate, re.IGNORECASE):
+            # Additional validation - make sure it's not just "CHAPTER" alone
+            chapter_part = re.sub(r'^\s*CHAPTER\s+', '', candidate, flags=re.IGNORECASE).strip()
+            if chapter_part:  # Must have something after "CHAPTER"
+                print(f"DEBUG: Found valid chapter: '{candidate.title()}'")
+                return True, candidate.title()
+    
+    print("DEBUG: No valid chapter found")
+    return False, None
+
+def extract_heading(page, aggressive_ocr=False):
+    """Extract heading text (Part/Chapter, multi-line safe) with debug output."""
+    print(f"\nDEBUG: extract_heading called for page")
+    
+    # Try regular text extraction first
+    text = page.get_text("text")
+    print(f"DEBUG: Regular text extraction result: {len(text)} characters")
+    
+    if aggressive_ocr and not text.strip():
+        print("DEBUG: Using aggressive OCR...")
+        text = ocr_page(page)
+        print(f"DEBUG: OCR result: {len(text)} characters")
+    
     lines = [line.strip() for line in text.splitlines() if line.strip()]
+    print(f"DEBUG: Extracted {len(lines)} non-empty lines")
+    
     if not lines:
+        print("DEBUG: No lines found, returning None")
         return None
 
-    first_line = lines[0]
-    if re.match(r'^\s*PART\s+\w+', first_line, re.IGNORECASE):
-        return first_line
-    if re.match(r'^\s*CHAPTER\s+\w+', first_line, re.IGNORECASE):
-        return first_line
+    # Show first few lines of extracted text
+    print("DEBUG: First 10 lines of extracted text:")
+    for i, line in enumerate(lines[:10]):
+        print(f"DEBUG:   {i}: '{line}'")
+
+    # Check PART first (look in first few lines only)
+    for i in range(min(5, len(lines))):  # Increased range to 5 lines
+        candidate = " ".join(lines[:i+1])
+        if PART_PAT.match(candidate):
+            result = candidate.title().replace("  ", " ")
+            print(f"DEBUG: Found PART: '{result}'")
+            return result
+
+    # Check CHAPTER with improved multi-line detection
+    print("DEBUG: Checking for chapter...")
+    chapter_result = detect_multiline_chapter(lines)
+    if chapter_result:
+        print(f"DEBUG: Multi-line chapter detected: '{chapter_result}'")
+        return chapter_result
+
+    # Check specials with multi-line support
+    print("DEBUG: Checking for special sections...")
+    for special in SPECIAL_PAT:
+        for i in range(min(5, len(lines))):  # Increased range to 5 lines
+            candidate = " ".join(lines[:i+1])
+            if special.match(candidate):
+                result = candidate.title()
+                print(f"DEBUG: Found special section: '{result}'")
+                return result
+
+    print("DEBUG: No heading found, returning None")
     return None
 
+def detect_multiline_chapter(lines):
+    """
+    Detect chapter headings that may span multiple lines.
+    Handles cases like:
+    - "CHAPTER ONE HUNDRED" + "AND NINE"
+    - "CHAPTER" + "ONE HUNDRED AND NINE"
+    """
+    if not lines:
+        return None
+    
+    print("DEBUG: detect_multiline_chapter called")
+    
+    # Look through first 5 lines for chapter patterns
+    for end_line in range(1, min(6, len(lines) + 1)):
+        candidate = " ".join(lines[:end_line])
+        print(f"DEBUG: Testing candidate ({end_line} lines): '{candidate}'")
+        
+        # Test if this multi-line candidate matches chapter pattern
+        if is_valid_chapter_title(candidate):
+            result = candidate.title().replace("  ", " ")
+            print(f"DEBUG: Valid chapter found: '{result}'")
+            return result
+    
+    print("DEBUG: No valid chapter found in multi-line detection")
+    return None
 
+def is_valid_chapter_title(text):
+    """
+    Check if the given text is a valid chapter title.
+    Supports multi-line chapter titles.
+    """
+    import re
+    
+    # Updated pattern to be more flexible with spacing and line breaks
+    chapter_patterns = [
+        r'^CHAPTER\s+(?:ONE\s+HUNDRED\s+(?:AND\s+)?(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY)?)$',
+        r'^CHAPTER\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY)(?:\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE))?$',
+        r'^CHAPTER\s+\d+$',  # Numeric chapters
+        r'^CHAPTER\s+[IVX]+$',  # Roman numeral chapters
+    ]
+    
+    text_normalized = ' '.join(text.upper().split())  # Normalize spacing
+    
+    for pattern in chapter_patterns:
+        if re.match(pattern, text_normalized):
+            print(f"DEBUG: Pattern matched: {pattern}")
+            return True
+    
+    print(f"DEBUG: No pattern matched for: '{text_normalized}'")
+    return False
+
+# Alternative approach if the above doesn't work - more aggressive multi-line detection
+def is_chapter_heading_improved(lines):
+    """
+    Improved chapter detection that specifically handles multi-line cases.
+    Returns (is_chapter, chapter_title) tuple.
+    """
+    if not lines:
+        return False, None
+    
+    print("DEBUG: is_chapter_heading_improved called")
+    
+    # Check if first line starts with "CHAPTER"
+    first_line = lines[0].upper().strip()
+    if not first_line.startswith('CHAPTER'):
+        return False, None
+    
+    print(f"DEBUG: First line starts with CHAPTER: '{first_line}'")
+    
+    # Try combining with subsequent lines to form complete chapter title
+    for i in range(1, min(4, len(lines) + 1)):  # Check up to 3 additional lines
+        combined = " ".join(lines[:i])
+        combined_upper = combined.upper().strip()
+        
+        print(f"DEBUG: Testing combined ({i} lines): '{combined}'")
+        
+        # Check if this looks like a complete chapter title
+        if is_complete_chapter_title(combined_upper):
+            result = combined.title().replace("  ", " ")
+            print(f"DEBUG: Complete chapter title found: '{result}'")
+            return True, result
+    
+    # If we can't find a complete title, return the first line if it has "CHAPTER"
+    if first_line.startswith('CHAPTER'):
+        result = first_line.title()
+        print(f"DEBUG: Returning partial chapter title: '{result}'")
+        return True, result
+    
+    return False, None
+
+def is_complete_chapter_title(text):
+    """Check if the text represents a complete chapter title."""
+    # Common complete chapter patterns
+    complete_patterns = [
+        r'CHAPTER\s+(?:ONE\s+HUNDRED\s+(?:AND\s+)?(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY)?)',
+        r'CHAPTER\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|ELEVEN|TWELVE|THIRTEEN|FOURTEEN|FIFTEEN|SIXTEEN|SEVENTEEN|EIGHTEEN|NINETEEN|TWENTY|THIRTY|FORTY|FIFTY|SIXTY|SEVENTY|EIGHTY|NINETY)(?:\s+(?:ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE))?',
+        r'CHAPTER\s+\d+',
+        r'CHAPTER\s+[IVX]+',
+    ]
+    
+    import re
+    for pattern in complete_patterns:
+        if re.match(pattern + r'$', text):
+            return True
+    
+    return False
+
+# Also add debug to your OCR function
+def ocr_page_debug(page):
+    """Run OCR on a PyMuPDF page and return extracted text with debug info."""
+    print("DEBUG: Starting OCR...")
+    pix = page.get_pixmap(dpi=300)
+    img_bytes = pix.tobytes("png")
+    img = Image.open(io.BytesIO(img_bytes))
+    text = pytesseract.image_to_string(img, lang="eng")
+    
+    print(f"DEBUG: OCR extracted {len(text)} characters")
+    print("DEBUG: First 200 characters of OCR text:")
+    print(repr(text[:200]))
+    
+    return text
 
 def extract_page_number(page):
-    """
-    Try to extract the page number printed at the bottom of the page.
-    Falls back to PDF index if no number found.
-    """
+    """Extract printed page number at bottom, fallback to PDF index."""
     text = page.get_text("text")
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
-        return page.number + 1  # fallback to logical PDF index
-
-    # Take last line as candidate for page number
+        return page.number + 1
     last_line = lines[-1]
     if last_line.isdigit():
         return int(last_line)
-
     return page.number + 1
 
-
-UPCASE = re.compile(r"^[A-Z0-9 \-:'\.,]+$")
-
-PART_RX = re.compile(r"\bPART\s+(ONE|TWO|THREE|FOUR|FIVE|SIX|SEVEN|EIGHT|NINE|TEN|[IVXLC]+)\b", re.I)
-CHAPTER_RX = re.compile(r"\bCHAPTER\s+([A-Z0-9]+)\b", re.I)
-PRO_EPILOGUE_RX = re.compile(r"\b(PROLOGUE|EPILOGUE)\b", re.I)
-CONTENTS_RX = re.compile(r"\bCONTENTS\b", re.I)
-
-SPECIAL_SECTIONS = [
-    "HONEYMOON",
-    "AN INTERVIEW WITH THE WOMEN'S MURDER CLUB",
-]
-
-DIGITS_RX = re.compile(r"(?:^|\D)(\d{1,4})(?:\D|$)")
-
-@dataclass
-class PageContext:
-    part_label: Optional[str] = None
-    part_title: Optional[str] = None
-    chapter_label: Optional[str] = None
-    chapter_title: Optional[str] = None
-
-@dataclass
-class PageDecision:
-    section_dir: str
-    file_name: str
-    book_page_number: int
-    debug: Dict[str, str] = field(default_factory=dict)
-
-def ocr_image(img: Image.Image, psm: int = 6) -> str:
-    # PSM 6 = Assume a single uniform block of text
-    try:
-        txt = pytesseract.image_to_string(img, config=f"--psm {psm}")
-    except Exception:
+def clean_directory_name(name):
+    """Clean a string to be safe for use as directory name."""
+    if not name:
         return ""
-    return txt or ""
-
-def page_to_image(page, zoom: float = 2.0) -> Image.Image:
-    mat = fitz.Matrix(zoom, zoom)
-    pix = page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-    return img
-
-def extract_text_blocks_top(page, fraction: float = 0.3) -> str:
-    # Prefer PDF text
-    try:
-        blocks = page.get_text("blocks")  # (x0, y0, x1, y1, "text", block_no, block_type)
-    except Exception:
-        blocks = []
-    if blocks:
-        h = page.rect.height
-        top_blocks = [b for b in blocks if b[1] <= h * fraction]
-        top_blocks.sort(key=lambda b: (b[1], b[0]))
-        return "\n".join((b[4] or "").strip() for b in top_blocks if (b[4] or "").strip())
-    # Fallback OCR on top region
-    img = page_to_image(page, 2.0)
-    w, h = img.size
-    crop = img.crop((0, 0, w, int(h * fraction)))
-    return ocr_image(crop, psm=4)
-
-def extract_page_number_bottom(page) -> Optional[int]:
-    # Try PDF text near bottom
-    h = page.rect.height
-    try:
-        blocks = page.get_text("blocks")
-    except Exception:
-        blocks = []
-    lines = []
-    if blocks:
-        bottom_blocks = [b for b in blocks if b[1] >= h * 0.80]
-        bottom_blocks.sort(key=lambda b: (b[1], b[0]))
-        for b in bottom_blocks:
-            t = (b[4] or "").strip()
-            if t:
-                lines.append(t)
-    text_bottom = " ".join(lines)
-    for m in DIGITS_RX.finditer(text_bottom):
-        try:
-            val = int(m.group(1))
-            if 1 <= val <= 2000:
-                return val
-        except Exception:
-            pass
-    # OCR bottom strip
-    img = page_to_image(page, 2.0)
-    w, h = img.size
-    crop = img.crop((0, int(h*0.82), w, h))
-    text = ocr_image(crop, psm=7)
-    for m in DIGITS_RX.finditer(text):
-        try:
-            val = int(m.group(1))
-            if 1 <= val <= 2000:
-                return val
-        except Exception:
-            pass
-    return None
-
-def classify_section(head_text: str, ctx: PageContext) -> Tuple[str, PageContext, Dict[str,str]]:
-    debug = {}
-    t = " ".join(head_text.split())
-    u = t.upper()
-    debug['head_text'] = t
-
-    # Special named sections
-    for s in SPECIAL_SECTIONS:
-        if s in u:
-            ctx.part_label = None
-            ctx.part_title = None
-            ctx.chapter_label = None
-            ctx.chapter_title = None
-            return (s.title(), ctx, {**debug, "match": f"SPECIAL:{s}"})
-
-    # Cover / Front Index heuristics (very early pages often have no part/chapter)
-    if CONTENTS_RX.search(t):
-        return ("Front Index", ctx, {**debug, "match": "CONTENTS"})
-
-    pe = PRO_EPILOGUE_RX.search(t)
-    if pe:
-        lab = pe.group(1).title()
-        ctx.chapter_label = lab
-        ctx.chapter_title = None
-        return (lab, ctx, {**debug, "match": "PRO_EPILOGUE"})
-
-    pm = PART_RX.search(t)
-    if pm:
-        roman = pm.group(1).title()
-        ctx.part_label = f"Part {roman}"
-        # Try to get a title line below "PART ..."
-        # Heuristic: pick next longest uppercase word sequence after match
-        after = t[pm.end():].strip(" -:")
-        title = None
-        # Choose a reasonable short title token
-        m2 = re.search(r"([A-Z][A-Za-z0-9' ]{3,60})", after)
-        if m2:
-            title = m2.group(1).strip()
-        ctx.part_title = title
-        ctx.chapter_label = None
-        ctx.chapter_title = None
-        return (ctx.part_label, ctx, {**debug, "match": "PART", "part_title": str(title)})
-
-    cm = CHAPTER_RX.search(t)
-    if cm:
-        lab = cm.group(0).title()
-        ctx.chapter_label = lab  # full "Chapter One"
-        # try title after chapter line
-        after = t[cm.end():].strip(" -:")
-        title = None
-        m3 = re.search(r"([A-Z][A-Za-z0-9' ]{3,60})", after)
-        if m3:
-            title = m3.group(1).strip()
-        ctx.chapter_title = title
-        return ("Chapter", ctx, {**debug, "match": "CHAPTER", "chapter_title": str(title)})
-
-    # Otherwise, keep current context; this is a normal page
-    label = (
-        ctx.part_label or
-        "Front Index"  # before first part
-    )
-    return (label, ctx, {**debug, "match": "FLOW"})
-
-def safe_name(s: Optional[str]) -> str:
-    if not s: 
-        return "Null Name"
-    s = re.sub(r"[\s]+", " ", s).strip()
-    s = s.replace("/", "-").replace("\\", "-").replace(":", " -")
-    return s
-
-def build_paths(root_name: str, book_base: str, section: str, ctx: PageContext, page_no: int) -> Tuple[str, str]:
-    # Directory tree: <root>/<root>/<book_base>_<Section or Part>/<...>
-    # Sample: WF_2141_3rd Degree/WF_2141_3rd Degree/WF_2141_3rd Degree_Part One/...
-    section_dir = f"{book_base}_{section.replace('/', '-')}"
-
-    # File name parts
-    parts = [book_base]
-    # If Part context applies, include "Part X" and optional title
-    if ctx.part_label:
-        parts.append(ctx.part_label)
-        parts.append(safe_name(ctx.part_title))
-    # If chapter context applies
-    if ctx.chapter_label:
-        parts.append(ctx.chapter_label)
-        parts.append(safe_name(ctx.chapter_title))
-    # Always end with page
-    parts.append(f"Page {page_no}")
-    file_name = "_".join(p for p in parts if p).replace("__", "_") + ".pdf"
-    return section_dir, file_name
-
-def process_single_page(args):
-    (pdf_path, out_root, dup_root, book_base, i, ctx_snapshot, force_ocr) = args
-    with fitz.open(pdf_path) as doc:
-        page = doc.load_page(i)
-        head_text = extract_text_blocks_top(page, 0.33)
-        if force_ocr or not head_text.strip():
-            # OCR the top strip if needed (already does)
-            pass
-        section, ctx_out, dbg = classify_section(head_text, ctx_snapshot)
-
-        # Get book page number
-        book_no = extract_page_number_bottom(page)
-        if book_no is None:
-            # fallback to i+1 if unknown
-            book_no = i + 1
-            dbg['page_no_fallback'] = True
-
-        # Directory + filename
-        section_dir, file_name = build_paths(dup_root, book_base, section, ctx_out, book_no)
-
-        # Build final output path
-        # Pattern: <out_root>/<dup_root>/<dup_root>/<section_dir>/<file_name>
-        final_dir = os.path.join(out_root, dup_root, dup_root, section_dir)
-        os.makedirs(final_dir, exist_ok=True)
-        out_pdf = os.path.join(final_dir, file_name)
-
-        # Write 1-page PDF preserving original size
-        dst = fitz.open()
-        src = fitz.open(pdf_path)
-        dst.insert_pdf(src, from_page=i, to_page=i)
-        dst.save(out_pdf, deflate=True, clean=True)
-        dst.close()
-        src.close()
-        return {"page": i, "out": out_pdf, "ctx": ctx_out, "section": section, "book_page": book_no, "debug": dbg}
+    
+    # First, let's debug what we're getting
+    print(f"DEBUG: Original name: '{name}' (length: {len(name)})")
+    print(f"DEBUG: Name repr: {repr(name)}")
+    
+    # Replace spaces with underscores
+    name = name.replace(" ", "_")
+    print(f"DEBUG: After space replacement: '{name}'")
+    
+    # Be more specific about what characters to replace
+    # Only replace truly problematic filesystem characters
+    name = re.sub(r'[<>:"/\\|?*]', '_', name)  # Removed the quotes from the pattern
+    print(f"DEBUG: After character replacement: '{name}'")
+    
+    # Remove multiple consecutive underscores
+    name = re.sub(r'_+', '_', name)
+    print(f"DEBUG: After underscore cleanup: '{name}'")
+    
+    # Remove leading/trailing underscores
+    name = name.strip('_')
+    print(f"DEBUG: Final result: '{name}'")
+    
+    return name
+# ---------- Main Processing ----------
 
 def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, aggressive_ocr: bool = False):
+    """
+    Process PDF and split into chapters with improved chapter detection.
+    Now includes debug logging to help troubleshoot issues.
+    """
     root_dup = reference_zip_root_name
     book_base = reference_zip_root_name
 
+    results = []
+    
+    # Log file for debugging
+    debug_log = []
+    
     with fitz.open(pdf_path) as doc:
         n = doc.page_count
+        debug_log.append(f"Processing PDF with {n} pages")
 
         current_part = None
         current_chapter = None
         seen_first_content = False
-        results = []
 
         for i in range(n):
             page = doc[i]
-            heading = extract_heading(page, aggressive_ocr)
             page_number = extract_page_number(page)
+            heading = extract_heading(page, aggressive_ocr)
 
-            # Detect Part
+            debug_info = f"Page {i} (printed: {page_number})"
+            
+            # ---------------- COVER (first 4 pages) ----------------
+            if i < 4:
+                cover_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Cover"
+                cover_dir.mkdir(parents=True, exist_ok=True)
+                if i == 0:
+                    filename = f"{book_base}_Front_Outer.pdf"
+                elif i == 1:
+                    filename = f"{book_base}_Front_Inner.pdf"
+                elif i == 2:
+                    filename = f"{book_base}_Back_Inner.pdf"
+                elif i == 3:
+                    filename = f"{book_base}_Back_Outer.pdf"
+                out_file = cover_dir / filename
+                save_page_as_pdf(page, out_file)
+                results.append({"page": i, "out": str(out_file)})
+                debug_log.append(f"{debug_info}: COVER -> {filename}")
+                continue
+
+            # ---------------- Detect Headings ----------------
             if heading and heading.upper().startswith("PART"):
-                current_part = heading.title().replace(" ", "_")
+                current_part = clean_directory_name(heading.title())
                 current_chapter = None
                 seen_first_content = True
-
-            # Detect Chapter
+                debug_log.append(f"{debug_info}: NEW PART detected: '{heading}' -> {current_part}")
+                
             elif heading and heading.upper().startswith("CHAPTER"):
-                if current_part:  # only allow chapters inside a part
-                    current_chapter = heading.title().replace(" ", "_")
-                else:
-                    current_chapter = heading.title().replace(" ", "_")  # fallback
+                clean_chapter = clean_directory_name(heading.title())
+                current_chapter = clean_chapter
                 seen_first_content = True
+                debug_log.append(f"{debug_info}: NEW CHAPTER detected: '{heading}' -> {current_chapter}")
 
-            # Section assignment
+            # ---------------- Section Assignment ----------------
             if not seen_first_content:
-                # Before any part/chapter
-                section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Front_Index"
+                # After cover but before first part/chapter -> Index
+                section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Index"
+                filename = f"{book_base}_Index_Page {i - 3}.pdf"
+                section_type = "Index"
             elif current_part and current_chapter:
-                # Inside chapter under a part
+                # Chapter within a part
                 section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
+                filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                section_type = f"Part+Chapter: {current_part}/{current_chapter}"
+            elif current_chapter and not current_part:
+                # Standalone chapter
+                section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_chapter}"
+                filename = f"{book_base}_{current_chapter}_Page {page_number}.pdf"
+                section_type = f"Chapter: {current_chapter}"
             elif current_part:
-                # Just part, no chapter yet
+                # Part page without specific chapter
                 section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}"
+                filename = f"{book_base}_{current_part}_Page {page_number}.pdf"
+                section_type = f"Part: {current_part}"
             else:
-                # After last content
+                # Fallback
                 section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Back_Index"
+                filename = f"{book_base}_Back_Index_Page {page_number}.pdf"
+                section_type = "Back Index"
 
             section_dir.mkdir(parents=True, exist_ok=True)
-
-            # Build output filename
-            if current_part and current_chapter:
-                filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_number}.pdf"
-            elif current_part:
-                filename = f"{book_base}_{current_part}_Page {page_number}.pdf"
-            elif not seen_first_content:
-                filename = f"{book_base}_Front_Index_Page {page_number}.pdf"
-            else:
-                filename = f"{book_base}_Back_Index_Page {page_number}.pdf"
-
             out_file = section_dir / filename
             save_page_as_pdf(page, out_file)
 
-            results.append({"page": i, "out": str(out_file)})
+            # Log the assignment
+            if heading:
+                debug_log.append(f"{debug_info}: Heading '{heading}' -> {section_type}")
+            else:
+                debug_log.append(f"{debug_info}: No heading -> {section_type}")
+
+            results.append({
+                "page": i, 
+                "out": str(out_file),
+                "heading": heading,
+                "section": str(section_dir),
+                "current_part": current_part,
+                "current_chapter": current_chapter
+            })
+
+    # Save debug log
+    debug_file = Path(output_root) / f"{book_base}_processing_debug.log"
+    with open(debug_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(debug_log))
+    
+    print(f"Debug log saved to: {debug_file}")
+    print(f"Processed {len(results)} pages")
+    
+    # Print summary of detected chapters
+    chapters_found = {}
+    for result in results:
+        if result.get('heading') and 'CHAPTER' in result['heading'].upper():
+            chapters_found[result['heading']] = result['section']
+    
+    if chapters_found:
+        print(f"\nDetected {len(chapters_found)} chapters:")
+        for chapter, directory in chapters_found.items():
+            print(f"  '{chapter}' -> {directory}")
+    else:
+        print("\nNo chapters detected - check the debug log for details")
 
     return results
+
+# Additional debugging function that can be called separately
+def debug_specific_pages(pdf_path: str, page_numbers: list):
+    """Debug specific pages to see what text is extracted and whether headings are detected."""
+    print(f"Debugging pages {page_numbers} in {pdf_path}")
+    
+    with fitz.open(pdf_path) as doc:
+        for page_num in page_numbers:
+            if page_num >= doc.page_count:
+                print(f"Page {page_num} doesn't exist (PDF has {doc.page_count} pages)")
+                continue
+                
+            page = doc[page_num]
+            print(f"\n{'='*50}")
+            print(f"PAGE {page_num}")
+            print(f"{'='*50}")
+            
+            # Extract text
+            text = page.get_text("text")
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            
+            print("First 15 lines:")
+            for i, line in enumerate(lines[:15]):
+                print(f"  {i:2d}: '{line}'")
+            
+            # Test heading detection
+            heading = extract_heading(page)
+            if heading:
+                print(f"\nHEADING DETECTED: '{heading}'")
+            else:
+                print(f"\nNO HEADING DETECTED")
+            
+            # Test chapter detection specifically
+            is_chapter, chapter_title = is_chapter_heading(lines)
+            if is_chapter:
+                print(f"CHAPTER DETECTION: YES - '{chapter_title}'")
+            else:
+                print(f"CHAPTER DETECTION: NO")
