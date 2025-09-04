@@ -53,6 +53,9 @@ def ocr_page_cached(pdf_path: str, page_number: int, dpi: int = 200) -> str:
 
 def is_chapter_candidate(text: str) -> bool:
     t = text.strip().upper()
+    # Heuristic: keep chapter headings short to avoid matching running headers
+    if len(t) > 40:
+        return False
     for pat in CHAPTER_PATTERNS:
         if pat.match(t):
             return True
@@ -74,7 +77,7 @@ def extract_heading_from_text(text: str) -> Optional[str]:
     # 1. Honeymoon special detection (inline or heading)
     for line in lines[:6]:
         if "HONEYMOON" in line.upper():
-            if len(line.split()) <= 4 or line.strip().isupper():
+            if len(line.split()) <= 6 or line.strip().isupper():
                 return "Honeymoon"
 
     # 2. Interview detection (can be multi-line)
@@ -102,7 +105,25 @@ def extract_heading_from_text(text: str) -> Optional[str]:
             subtitle = " " + lines[1]
         return (lines[0] + subtitle).title().replace("  ", " ")
 
+    # 6. Fallback wide-scan for Honeymoon/Interview when no heading found
+    upper_text = text.upper()
+    if " HONEYMOON" in upper_text or upper_text.startswith("HONEYMOON"):
+        return "Honeymoon"
+    if "AN INTERVIEW WITH THE WOMEN" in upper_text:
+        return "An Interview With The Women's Murder Club"
+
     return None
+
+def is_blank_page(text: str) -> bool:
+    s = text.strip()
+    if not s:
+        return True
+    # If the page contains only a small number or minimal characters, treat as blank/number-only
+    if s.isdigit() and len(s) <= 3:
+        return True
+    if len(s) <= 5:
+        return True
+    return False
 
 def extract_page_number_from_text(text: str, default_page_index: int) -> int:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
@@ -137,6 +158,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
         current_part = None
         current_chapter = None
         seen_first_content = False
+        # Lock a few pages after setting a parent to keep early pages inside parent
+        parent_lock_remaining = 0
 
         for i, page in enumerate(doc):
             text = page.get_text("text")
@@ -146,6 +169,9 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                 text = ocr_page_cached(pdf_path, i)
 
             heading = extract_heading_from_text(text)
+            # During parent lock, ignore chapter headings to avoid running-header false positives
+            if heading and heading.upper().startswith("CHAPTER") and parent_lock_remaining > 0:
+                heading = None
             debug_info = f"Page {i} (printed: {page_number})"
 
             # COVER (first 4 pages)
@@ -176,6 +202,7 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                     current_part = None
                     current_chapter = None
                     seen_first_content = True
+                    parent_lock_remaining = 2
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}"
                     filename = f"{book_base}_{current_parent}_Page {page_number}.pdf"
                     section_type = f"Parent: {current_parent}"
@@ -279,6 +306,10 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                 "current_chapter": current_chapter
             })
 
+            # Decrement parent lock after processing this page
+            if parent_lock_remaining > 0:
+                parent_lock_remaining -= 1
+
     debug_file = Path(output_root) / f"{book_base}_processing_debug.log"
     with open(debug_file, 'w', encoding='utf-8') as f:
         f.write('\n'.join(debug_log))
@@ -286,3 +317,9 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
     print(f"Debug log saved to: {debug_file}")
     print(f"Processed {len(results)} pages")
     return results
+
+# Compatibility wrapper for debug script
+def ocr_page(page, dpi: int = 200) -> str:
+    pix = page.get_pixmap(dpi=dpi)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return pytesseract.image_to_string(img, lang="eng")
