@@ -62,7 +62,7 @@ def extract_heading_from_text(text: str) -> Optional[str]:
     """
     Extract heading string.
     Handles:
-      - SPECIAL_PARENT (HONEYMOON, INTERVIEW)
+      - SPECIAL_PARENT (Honeymoon, Interview) including inline matches
       - PART
       - CHAPTER
       - SPECIAL (Prologue/Epilogue + optional subtitle like WHODUNWHAT)
@@ -71,32 +71,36 @@ def extract_heading_from_text(text: str) -> Optional[str]:
     if not lines:
         return None
 
-    # SPECIAL_PARENT first
-    for end_line in range(1, min(3, len(lines) + 1)):
-        candidate = " ".join(lines[:end_line])
-        for pat in SPECIAL_PARENT_PAT:
-            if pat.match(candidate):
-                return candidate.title().replace("  ", " ")
+    # 1. Honeymoon special detection (inline or heading)
+    for line in lines[:6]:
+        if "HONEYMOON" in line.upper():
+            if len(line.split()) <= 4 or line.strip().isupper():
+                return "Honeymoon"
 
-    # PART
+    # 2. Interview detection (can be multi-line)
+    for end_line in range(1, min(6, len(lines) + 1)):
+        candidate = " ".join(lines[:end_line])
+        if "AN INTERVIEW WITH THE WOMEN" in candidate.upper():
+            return "An Interview With The Women's Murder Club"
+
+    # 3. PART
     for end_line in range(1, min(4, len(lines) + 1)):
         candidate = " ".join(lines[:end_line])
         if PART_PAT.match(candidate):
             return candidate.title().replace("  ", " ")
 
-    # CHAPTER
+    # 4. CHAPTER
     for end_line in range(1, min(4, len(lines) + 1)):
         candidate = " ".join(lines[:end_line])
         if is_chapter_candidate(candidate):
             return candidate.title().replace("  ", " ")
 
-    # SPECIAL (Prologue/Epilogue + optional subtitle)
-    for pat in SPECIAL_PAT:
-        if pat.match(lines[0]):
-            subtitle = ""
-            if len(lines) > 1 and lines[1].isupper():
-                subtitle = " " + lines[1]
-            return (lines[0] + subtitle).title().replace("  ", " ")
+    # 5. Specials (Prologue/Epilogue with subtitle)
+    if lines[0].upper().startswith("PROLOGUE") or lines[0].upper().startswith("EPILOGUE"):
+        subtitle = ""
+        if len(lines) > 1 and lines[1].isupper():
+            subtitle = " " + lines[1]
+        return (lines[0] + subtitle).title().replace("  ", " ")
 
     return None
 
@@ -166,8 +170,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
             if heading:
                 h_upper = heading.upper()
 
-                # Parent specials
-                if any(p.match(heading) for p in SPECIAL_PARENT_PAT):
+                # SPECIAL PARENT (Honeymoon, Interview)
+                if "HONEYMOON" in h_upper or "AN INTERVIEW" in h_upper:
                     current_parent = clean_directory_name(heading.title())
                     current_part = None
                     current_chapter = None
@@ -211,8 +215,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         filename = f"{book_base}_{current_chapter}_Page {page_number}.pdf"
                         section_type = f"Chapter: {current_chapter}"
 
-                # Specials (Prologue/Epilogue)
-                elif any(p.match(heading.split()[0]) for p in SPECIAL_PAT):
+                # PROLOGUE / EPILOGUE
+                elif h_upper.startswith("PROLOGUE") or h_upper.startswith("EPILOGUE"):
                     current_chapter = clean_directory_name(heading.title())
                     seen_first_content = True
                     if current_parent:
