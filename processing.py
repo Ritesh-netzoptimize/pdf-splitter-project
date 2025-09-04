@@ -158,6 +158,10 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
     results = []
     debug_log = []
     created_dirs = set()
+    # Track display page numbering across Parts:
+    # First Part starts at 1; successive Parts continue numbering (+1 from last)
+    part_sequence_started = False
+    part_page_counter = 0
 
     # Create Whole Book folder and copy original PDF into it
     whole_book_root = Path(output_root) / root_dup / root_dup / f"{book_base}_Whole_Book"
@@ -198,6 +202,16 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                 if u.startswith("PART") or u.startswith("CHAPTER") or u.startswith("PROLOGUE") or u.startswith("EPILOGUE"):
                     return nxt_heading
             return None
+
+        def get_and_advance_part_page_number() -> int:
+            nonlocal part_sequence_started, part_page_counter
+            if not part_sequence_started:
+                part_sequence_started = True
+                part_page_counter = 1
+                return 1
+            else:
+                part_page_counter += 1
+                return part_page_counter
 
         for i, page in enumerate(doc):
             text = page.get_text("text")
@@ -252,11 +266,13 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                     seen_first_content = True
                     if current_parent:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}"
-                        filename = f"{book_base}_{current_parent}_{current_part}_Page {page_number}.pdf"
+                        page_num_for_filename = get_and_advance_part_page_number()
+                        filename = f"{book_base}_{current_parent}_{current_part}_Page {page_num_for_filename}.pdf"
                         section_type = f"Part under parent: {current_parent}/{current_part}"
                     else:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}"
-                        filename = f"{book_base}_{current_part}_Page {page_number}.pdf"
+                        page_num_for_filename = get_and_advance_part_page_number()
+                        filename = f"{book_base}_{current_part}_Page {page_num_for_filename}.pdf"
                         section_type = f"Part (root): {current_part}"
 
                 # CHAPTER
@@ -265,7 +281,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                     seen_first_content = True
                     if current_parent and current_part:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}" / f"{book_base}_{current_parent}_{current_part}_{current_chapter}"
-                        filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                        page_num_for_filename = get_and_advance_part_page_number()
+                        filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                         section_type = f"Chapter under parent+part: {current_parent}/{current_part}/{current_chapter}"
                     elif current_parent:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
@@ -273,7 +290,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         section_type = f"Chapter under parent: {current_parent}/{current_chapter}"
                     elif current_part:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
-                        filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                        page_num_for_filename = get_and_advance_part_page_number()
+                        filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                         section_type = f"Chapter under part: {current_part}/{current_chapter}"
                     else:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_chapter}"
@@ -290,7 +308,8 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         section_type = f"Special under parent: {current_parent}/{current_chapter}"
                     elif current_part:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
-                        filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                        page_num_for_filename = get_and_advance_part_page_number()
+                        filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                         section_type = f"Special under part: {current_part}/{current_chapter}"
                     else:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_chapter}"
@@ -330,11 +349,13 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         section_type = "Page inside parent"
                 elif current_parent and current_part and current_chapter:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}" / f"{book_base}_{current_parent}_{current_part}_{current_chapter}"
-                    filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                    page_num_for_filename = get_and_advance_part_page_number()
+                    filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                     section_type = "Page inside parent+part+chapter"
                 elif current_parent and current_part:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}"
-                    filename = f"{book_base}_{current_parent}_{current_part}_Page {page_number}.pdf"
+                    page_num_for_filename = get_and_advance_part_page_number()
+                    filename = f"{book_base}_{current_parent}_{current_part}_Page {page_num_for_filename}.pdf"
                     section_type = "Page inside parent+part"
                 elif current_parent:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}"
@@ -342,11 +363,13 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                     section_type = "Page inside parent"
                 elif current_part and current_chapter:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
-                    filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_number}.pdf"
+                    page_num_for_filename = get_and_advance_part_page_number()
+                    filename = f"{book_base}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                     section_type = "Page inside part+chapter"
                 elif current_part:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}"
-                    filename = f"{book_base}_{current_part}_Page {page_number}.pdf"
+                    page_num_for_filename = get_and_advance_part_page_number()
+                    filename = f"{book_base}_{current_part}_Page {page_num_for_filename}.pdf"
                     section_type = "Page inside part"
                 else:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_Back_Index"
