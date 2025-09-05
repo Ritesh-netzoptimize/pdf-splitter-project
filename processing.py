@@ -124,6 +124,20 @@ def extract_heading_from_text(text: str) -> Optional[str]:
 
     return None
 
+
+def looks_like_honeymoon_block(text: str) -> bool:
+    """Heuristic: Detect a small paragraph containing the word HONEYMOON with 1-2 lines before/after.
+    This handles the case where the Honeymoon heading is not an isolated uppercase heading or has no page number.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    joined = " ".join(lines[:5]).upper()
+    # If HONEYMOON appears and the block is short, treat as honeymoon block
+    if "HONEYMOON" in joined and len(joined.split()) <= 30:
+        return True
+    return False
+
 def is_blank_page(text: str) -> bool:
     s = text.strip()
     if not s:
@@ -189,9 +203,21 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
         seen_first_content = False
         # Lock a few pages after setting a parent to keep early pages inside parent
         parent_lock_remaining = 0
+        # Track pages we manually saved to avoid double-processing
+        saved_pages = set()
+        # Track last seen part under the current parent (to associate later chapters)
+        last_part_under_parent = None
+        # Flag: if current_chapter was set by a special (Prologue/Epilogue), treat subsequent CHAPTERs as nested under that special
+        current_chapter_is_special = False
+        # Name of current special (Prologue/Epilogue) under the parent
+        current_special = None
 
         def detect_upcoming_child(start_index: int) -> Optional[str]:
             """Look ahead a couple of pages to see if a child section starts soon."""
+            # If we're still in the parent lock period, don't route preceding pages to an upcoming child
+            if parent_lock_remaining > 0:
+                return None
+
             lookahead_limit = min(n, start_index + 3)
             for j in range(start_index + 1, lookahead_limit):
                 nxt = doc[j]
@@ -221,7 +247,39 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
             if aggressive_ocr and not text.strip():
                 text = ocr_page_cached(pdf_path, i)
 
+            # Skip pages we've already saved as part of multi-page section handling
+            if i in saved_pages:
+                debug_log.append(f"Skipping page {i} because it was already saved as part of a multi-page section")
+                continue
+
             heading = extract_heading_from_text(text)
+            # Special-case: detect Honeymoon block even if not returned as a heading
+            # But avoid re-detecting Honeymoon when the same parent is already active
+            if not heading and looks_like_honeymoon_block(text) and (current_parent is None or current_parent != clean_directory_name("Honeymoon")):
+                heading = "Honeymoon"
+                # Prepare parent state
+                current_parent = clean_directory_name(heading.title())
+                current_part = None
+                current_chapter = None
+                seen_first_content = True
+                parent_lock_remaining = 2
+                # If next page exists and is blank/short, save it into the parent directory
+                try:
+                    nxt = doc[i+1]
+                    nxt_text = nxt.get_text("text")
+                    if aggressive_ocr and not nxt_text.strip():
+                        nxt_text = ocr_page_cached(pdf_path, i+1)
+                    if is_blank_page(nxt_text) or len(nxt_text.strip()) <= 20:
+                        section_dir_tmp = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}"
+                        section_dir_tmp.mkdir(parents=True, exist_ok=True)
+                        next_page_num = extract_page_number_from_text(nxt_text, nxt.number)
+                        next_out = section_dir_tmp / f"{book_base}_{current_parent}_Page {next_page_num}.pdf"
+                        save_page_as_pdf(nxt, next_out)
+                        saved_pages.add(i+1)
+                        results.append({"page": i+1, "out": str(next_out), "heading": None, "section": str(section_dir_tmp), "current_parent": current_parent, "current_part": current_part, "current_chapter": current_chapter})
+                        debug_log.append(f"Auto-saved following blank page {i+1} into honeymoon parent: {next_out}")
+                except Exception:
+                    pass
             # During parent lock, ignore chapter headings to avoid running-header false positives
             if heading and heading.upper().startswith("CHAPTER") and parent_lock_remaining > 0:
                 heading = None
@@ -249,6 +307,12 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
             if heading:
                 h_upper = heading.upper()
 
+                # If the detected heading is the same parent that's already active, ignore it
+                if "HONEYMOON" in h_upper and current_parent and current_parent == clean_directory_name(heading.title()):
+                    heading = None
+                    # fall through to fallback routing below
+                    continue
+
                 # SPECIAL PARENT (Honeymoon, Interview)
                 if "HONEYMOON" in h_upper or "AN INTERVIEW" in h_upper:
                     current_parent = clean_directory_name(heading.title())
@@ -270,6 +334,22 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         page_num_for_filename = get_and_advance_part_page_number()
                         filename = f"{book_base}_{current_parent}_{current_part}_Page {page_num_for_filename}.pdf"
                         section_type = f"Part under parent: {current_parent}/{current_part}"
+                        # If next page exists and is blank/short, include it in this part directory
+                        try:
+                            nxt = doc[i+1]
+                            nxt_text = nxt.get_text("text")
+                            if aggressive_ocr and not nxt_text.strip():
+                                nxt_text = ocr_page_cached(pdf_path, i+1)
+                            if is_blank_page(nxt_text) or len(nxt_text.strip()) <= 20:
+                                section_dir.mkdir(parents=True, exist_ok=True)
+                                next_page_num = extract_page_number_from_text(nxt_text, nxt.number)
+                                next_out = section_dir / f"{book_base}_{current_parent}_{current_part}_Page {next_page_num}.pdf"
+                                save_page_as_pdf(nxt, next_out)
+                                saved_pages.add(i+1)
+                                results.append({"page": i+1, "out": str(next_out), "heading": None, "section": str(section_dir), "current_parent": current_parent, "current_part": current_part, "current_chapter": current_chapter})
+                                debug_log.append(f"Auto-saved following blank page {i+1} into part under parent: {next_out}")
+                        except Exception:
+                            pass
                     else:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}"
                         page_num_for_filename = get_and_advance_part_page_number()
@@ -286,9 +366,22 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         filename = f"{book_base}_{current_parent}_{current_part}_{current_chapter}_Page {page_num_for_filename}.pdf"
                         section_type = f"Chapter under parent+part: {current_parent}/{current_part}/{current_chapter}"
                     elif current_parent:
-                        section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
-                        filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
-                        section_type = f"Chapter under parent: {current_parent}/{current_chapter}"
+                        # If we are under a parent and there is a last_part_under_parent, prefer nesting under that part
+                        if last_part_under_parent:
+                            # nested as Parent -> Part -> Chapter
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{last_part_under_parent}" / f"{book_base}_{current_parent}_{last_part_under_parent}_{current_chapter}"
+                            page_num_for_filename = get_and_advance_part_page_number()
+                            filename = f"{book_base}_{current_parent}_{last_part_under_parent}_{current_chapter}_Page {page_num_for_filename}.pdf"
+                            section_type = f"Chapter under parent+last_part: {current_parent}/{last_part_under_parent}/{current_chapter}"
+                        elif current_chapter_is_special:
+                            # If current chapter was set by a special (Prologue), put chapters under that special subdir
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
+                            filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
+                            section_type = f"Chapter under parent special: {current_parent}/{current_chapter}"
+                        else:
+                            section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
+                            filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
+                            section_type = f"Chapter under parent: {current_parent}/{current_chapter}"
                     elif current_part:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
                         page_num_for_filename = get_and_advance_part_page_number()
@@ -302,11 +395,29 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                 # PROLOGUE / EPILOGUE
                 elif h_upper.startswith("PROLOGUE") or h_upper.startswith("EPILOGUE"):
                     current_chapter = clean_directory_name(heading.title())
+                    # mark current special
+                    current_special = current_chapter
                     seen_first_content = True
                     if current_parent:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
                         filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
                         section_type = f"Special under parent: {current_parent}/{current_chapter}"
+                        # Include the next page if it's blank/short into this prologue subdirectory
+                        try:
+                            nxt = doc[i+1]
+                            nxt_text = nxt.get_text("text")
+                            if aggressive_ocr and not nxt_text.strip():
+                                nxt_text = ocr_page_cached(pdf_path, i+1)
+                            if is_blank_page(nxt_text) or len(nxt_text.strip()) <= 20:
+                                section_dir.mkdir(parents=True, exist_ok=True)
+                                next_page_num = extract_page_number_from_text(nxt_text, nxt.number)
+                                next_out = section_dir / f"{book_base}_{current_parent}_{current_chapter}_Page {next_page_num}.pdf"
+                                save_page_as_pdf(nxt, next_out)
+                                saved_pages.add(i+1)
+                                results.append({"page": i+1, "out": str(next_out), "heading": None, "section": str(section_dir), "current_parent": current_parent, "current_part": current_part, "current_chapter": current_chapter})
+                                debug_log.append(f"Auto-saved following blank page {i+1} into prologue subdir: {next_out}")
+                        except Exception:
+                            pass
                     elif current_part:
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_part}" / f"{book_base}_{current_part}_{current_chapter}"
                         page_num_for_filename = get_and_advance_part_page_number()
@@ -330,17 +441,35 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         up_upper = upcoming.upper()
                         if up_upper.startswith("PROLOGUE") or up_upper.startswith("EPILOGUE"):
                             child = clean_directory_name(upcoming.title())
+                            # Set the current special (prologue/epilogue)
+                            current_special = child
+                            current_chapter = None
+                            current_chapter_is_special = True
+                            seen_first_content = True
+                            parent_lock_remaining = 2
                             section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
                             filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
                             section_type = f"Preceding page routed to upcoming special under parent: {current_parent}/{child}"
                         elif up_upper.startswith("PART"):
                             child = clean_directory_name(upcoming.title())
+                            # Set the current part to the upcoming part
+                            current_part = child
+                            last_part_under_parent = child
+                            current_chapter = None
+                            current_chapter_is_special = False
+                            seen_first_content = True
+                            parent_lock_remaining = 2
                             section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
-                            filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
+                            page_num_for_filename = get_and_advance_part_page_number()
+                            filename = f"{book_base}_{current_parent}_{child}_Page {page_num_for_filename}.pdf"
                             section_type = f"Preceding page routed to upcoming part under parent: {current_parent}/{child}"
                         elif up_upper.startswith("CHAPTER"):
                             # Rare: chapter directly under parent; place under parent+chapter
                             child = clean_directory_name(upcoming.title())
+                            # Treat this as the upcoming chapter under the parent (set current_chapter)
+                            current_chapter = child
+                            current_chapter_is_special = False
+                            seen_first_content = True
                             section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{child}"
                             filename = f"{book_base}_{current_parent}_{child}_Page {page_number}.pdf"
                             section_type = f"Preceding page routed to upcoming chapter under parent: {current_parent}/{child}"
@@ -348,6 +477,11 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}"
                         filename = f"{book_base}_{current_parent}_Page {page_number}.pdf"
                         section_type = "Page inside parent"
+                # Parent with a current chapter (no part) -> route pages into that chapter subdirectory
+                elif current_parent and current_chapter:
+                    section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
+                    filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
+                    section_type = "Page inside parent+chapter"
                 elif current_parent and current_part and current_chapter:
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_part}" / f"{book_base}_{current_parent}_{current_part}_{current_chapter}"
                     page_num_for_filename = get_and_advance_part_page_number()
