@@ -97,7 +97,8 @@ def extract_heading_from_text(text: str) -> Optional[str]:
     for end_line in range(1, min(4, len(lines) + 1)):
         candidate = " ".join(lines[:end_line])
         if is_chapter_candidate(candidate):
-            return candidate.title().replace("  ", " ")
+            heading = candidate.title().replace("  ", " ")
+            return f"{heading} Null Name"
 
     # 5. Specials (Prologue/Epilogue with subtitle)
     if lines[0].upper().startswith("PROLOGUE") or lines[0].upper().startswith("EPILOGUE"):
