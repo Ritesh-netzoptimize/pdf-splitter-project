@@ -358,6 +358,48 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
 
                 # CHAPTER
                 elif h_upper.startswith("CHAPTER") or is_chapter_candidate(heading):
+                    # Special case: if a CHAPTER appears directly after a Prologue/other special
+                    # that was set under the current parent (e.g. Honeymoon -> Prologue Whodunwhat),
+                    # create a Chapter_Null_Name subdirectory inside the parent+special and
+                    # save the chapter page plus the next 3 pages there.
+                    if current_parent and current_special and (current_chapter == current_special or current_chapter_is_special):
+                        # build the special chapter directory name requested by the user
+                        special_chapter_label = f"{current_special}_Chapter_Null_Name"
+                        current_chapter = clean_directory_name(special_chapter_label)
+                        # this is now a real chapter under the special; clear the special-flag
+                        current_chapter_is_special = False
+                        # directory: <root>/<root>/<book>_<parent>/<book>_<parent>_<special>/<book>_<parent>_<special>_Chapter_Null_Name
+                        section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_special}" / f"{book_base}_{current_parent}_{current_special}_{current_chapter}"
+                        section_dir.mkdir(parents=True, exist_ok=True)
+                        # Save this chapter page and the next 3 pages into the new chapter subdir
+                        for j in range(i, min(n, i + 4)):
+                            if j in saved_pages:
+                                continue
+                            try:
+                                p = doc[j]
+                                p_text = p.get_text("text")
+                                if aggressive_ocr and not p_text.strip():
+                                    p_text = ocr_page_cached(pdf_path, j)
+                                p_num = extract_page_number_from_text(p_text, p.number)
+                                out_name = f"{book_base}_{current_parent}_{current_special}_{current_chapter}_Page {p_num}.pdf"
+                                out_path = section_dir / out_name
+                                save_page_as_pdf(p, out_path)
+                                saved_pages.add(j)
+                                results.append({
+                                    "page": j,
+                                    "out": str(out_path),
+                                    "heading": "Chapter (migrated to Null Name)",
+                                    "section": str(section_dir),
+                                    "current_parent": current_parent,
+                                    "current_part": current_part,
+                                    "current_chapter": current_chapter
+                                })
+                                debug_log.append(f"Auto-saved chapter block page {j} into special chapter subdir: {out_path}")
+                            except Exception:
+                                debug_log.append(f"Failed to auto-save chapter subpage {j}")
+                        # skip normal processing for the current index since pages were handled
+                        continue
+
                     current_chapter = clean_directory_name(heading.title())
                     seen_first_content = True
                     if current_parent and current_part:
@@ -479,6 +521,51 @@ def process_pdf(pdf_path: str, output_root: str, reference_zip_root_name: str, a
                         section_type = "Page inside parent"
                 # Parent with a current chapter (no part) -> route pages into that chapter subdirectory
                 elif current_parent and current_chapter:
+                    # Special heuristic: if we're inside a special (Prologue/Epilogue) subdir
+                    # and we hit a non-heading page with substantial body text (e.g., >50 words),
+                    # treat this as the start of an implicit chapter and create a
+                    # <Special>_Chapter_Null_Name subdirectory under the current special.
+                    # Move this page and the next 3 pages into that subdirectory.
+                    is_inside_special = (current_special is not None and current_chapter == current_special)
+                    words = len(text.split()) if text else 0
+                    if is_inside_special and not heading and not is_blank_page(text) and words >= 50:
+                        # create chapter null name under the special
+                        special_chapter_label = f"{current_special}_Chapter_Null_Name"
+                        new_chapter = clean_directory_name(special_chapter_label)
+                        # directory: <root>/<root>/<book>_<parent>/<book>_<parent>_<special>/<book>_<parent>_<special>_<new_chapter>
+                        chapter_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_special}" / f"{book_base}_{current_parent}_{current_special}_{new_chapter}"
+                        chapter_dir.mkdir(parents=True, exist_ok=True)
+                        # save this page and next 3 pages into the chapter_dir
+                        for j in range(i, min(n, i + 4)):
+                            if j in saved_pages:
+                                continue
+                            try:
+                                p = doc[j]
+                                p_text = p.get_text("text")
+                                if aggressive_ocr and not p_text.strip():
+                                    p_text = ocr_page_cached(pdf_path, j)
+                                p_num = extract_page_number_from_text(p_text, p.number)
+                                out_name = f"{book_base}_{current_parent}_{current_special}_{new_chapter}_Page {p_num}.pdf"
+                                out_path = chapter_dir / out_name
+                                save_page_as_pdf(p, out_path)
+                                saved_pages.add(j)
+                                results.append({
+                                    "page": j,
+                                    "out": str(out_path),
+                                    "heading": None,
+                                    "section": str(chapter_dir),
+                                    "current_parent": current_parent,
+                                    "current_part": current_part,
+                                    "current_chapter": new_chapter
+                                })
+                                debug_log.append(f"Auto-saved implicit chapter page {j} into: {out_path}")
+                            except Exception:
+                                debug_log.append(f"Failed to auto-save implicit chapter page {j}")
+                        # set the current chapter to the new implicit chapter and continue main loop
+                        current_chapter = new_chapter
+                        current_chapter_is_special = False
+                        continue
+
                     section_dir = Path(output_root) / root_dup / root_dup / f"{book_base}_{current_parent}" / f"{book_base}_{current_parent}_{current_chapter}"
                     filename = f"{book_base}_{current_parent}_{current_chapter}_Page {page_number}.pdf"
                     section_type = "Page inside parent+chapter"
